@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.functional as F
+from torch import tensor
 import gymnasium as gym
+from dataclasses import dataclass
 
 class SimpleNet(nn.Module):
     """A simple neural network
@@ -18,14 +20,40 @@ class SimpleNet(nn.Module):
 
     def forward(self,x:torch.Tensor):
         return self.net(x)
-    
-def generate_episodes(env, net):
-    obs, info = env.reset()
-    print(f"{obs} {type(obs)}")
-    t_obs = torch.tensor(obs,dtype=torch.float32)
-    action_logits = net(t_obs)
-    print(f"{action_logits}")
 
+@dataclass
+class EpisodeStep:
+    observation: tensor
+    action: int
+
+@dataclass
+class Episode:
+    reward: float
+    steps: list[EpisodeStep]
+
+
+def generate_episode(env:gym.Env, net:SimpleNet):
+    terminated,truncated = False,False
+    total_reward = 0.0
+    obs, info = env.reset()
+    steps = []
+    while( not terminated and not truncated): 
+        print(f"{obs} {type(obs)}")
+        t_obs = torch.tensor(obs,dtype=torch.float32)
+        action_logits = net(t_obs)
+        print(f"{action_logits}")
+        action_prob = torch.softmax(action_logits,dim=-1)
+        print(f"{action_prob}")
+        # sample action
+        action = torch.multinomial(action_prob,num_samples=1).item()
+        print(f"sampled action {action}")
+        steps.append(EpisodeStep(observation=t_obs, action=action))
+        obs, reward, terminated, truncated,info = env.step(action)
+        print(f"reward {reward} terminated {terminated} truncated {truncated} info {info}")
+        total_reward += reward
+
+    return Episode(reward=total_reward, steps=steps)
+        
 
 def init_env():
     env = gym.make("CartPole-v1")
@@ -42,4 +70,9 @@ def init_env():
 if __name__ == "__main__":
     env = init_env()
     net = SimpleNet(4,2,128)
-    generate_episodes(env,net)
+    print(f"{'-'*20} Episode Result {'-'*20}")
+    for _ in range(10):
+        episode = generate_episode(env,net)
+
+        print(f"Episode reward: {episode.reward}")
+
