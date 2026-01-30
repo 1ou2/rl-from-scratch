@@ -19,11 +19,27 @@ class SimpleNet(nn.Module):
     def forward(self,x:torch.Tensor):
         return self.net(x)
     
+def generate_episodes(env, net):
+    obs, info = env.reset()
+    print(f"{obs} {type(obs)}")
+    t_obs = torch.tensor(obs,dtype=torch.float32)
+    action_logits = net(t_obs)
+    print(f"{action_logits}")
+
+
 def init_env():
     env = gym.make("CartPole-v1")
     obs, info = env.reset()
-    print(f"obs {obs}")
+    act = env.action_space.sample() 
+    print(f"obs space {env.observation_space}")
+    print(f"act space {env.action_space}")
+    print(f"sample action {act}") # take a random action
+    print(f"sample obs {obs}")
     print(f"info {info}")
+
+    return env
     
 if __name__ == "__main__":
-    init_env()
+    env = init_env()
+    net = SimpleNet(4,2,128)
+    generate_episodes(env,net)
