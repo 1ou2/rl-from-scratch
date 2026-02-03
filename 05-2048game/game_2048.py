@@ -23,23 +23,30 @@ class Game2048(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self, render_mode: Optional[str] = None, seed: Optional[int] = None):
+    def __init__(self, render_mode: Optional[str] = None, seed: Optional[int] = None, 
+                 max_episode_steps: int = 2000, max_consecutive_invalid_moves: int = 10):
         """
         Initialize the 2048 game environment.
         
         Args:
             render_mode: Optional render mode ('human' or None)
             seed: Random seed for reproducibility
+            max_episode_steps: Maximum number of steps per episode (prevents infinite episodes)
+            max_consecutive_invalid_moves: Maximum consecutive invalid moves before truncation
         """
         super().__init__()
         
         self.render_mode = render_mode
         self._rng = np.random.RandomState(seed)
+        self.max_episode_steps = max_episode_steps
+        self.max_consecutive_invalid_moves = max_consecutive_invalid_moves
         
         # Game grid: 4x4
         self.grid: np.ndarray = np.zeros((4, 4), dtype=np.int32)
         self.score: int = 0
         self.moves_made: int = 0
+        self.total_steps: int = 0  # Total steps taken (including invalid moves)
+        self.consecutive_invalid_moves: int = 0
         
         # Action space: 4 directions (up, down, left, right)
         self.action_space = spaces.Discrete(4)
@@ -60,6 +67,8 @@ class Game2048(gym.Env):
         self.grid = np.zeros((4, 4), dtype=np.int32)
         self.score = 0
         self.moves_made = 0
+        self.total_steps = 0
+        self.consecutive_invalid_moves = 0
         
         # Add two initial tiles
         self._spawn_tile()
@@ -247,23 +256,36 @@ class Game2048(gym.Env):
         # Check if the move was valid (grid changed)
         grid_changed = not np.array_equal(old_grid, self.grid)
         
-        # If grid changed, spawn a new tile
+        # Update step counters
+        self.total_steps += 1
+        
+        # If grid changed, spawn a new tile and reset invalid move counter
         if grid_changed:
             self._spawn_tile()
             self.moves_made += 1
+            self.consecutive_invalid_moves = 0
+        else:
+            # Invalid move - increment counter
+            self.consecutive_invalid_moves += 1
         
         # Check if game is over
         terminated = self._is_game_over()
         
-        # Truncated is False (we don't have a time limit)
-        truncated = False
+        # Check truncation conditions
+        truncated = (
+            self.total_steps >= self.max_episode_steps or
+            self.consecutive_invalid_moves >= self.max_consecutive_invalid_moves
+        )
         
         # Info dictionary
         info = {
             "score": self.score,
             "moves": self.moves_made,
+            "total_steps": self.total_steps,
+            "consecutive_invalid_moves": self.consecutive_invalid_moves,
             "grid_changed": grid_changed,
-            "game_over": terminated
+            "game_over": terminated,
+            "truncated_reason": self._get_truncation_reason() if truncated else None
         }
         
         # Observation: return the grid as is (values are log2 of tile values)
@@ -291,6 +313,8 @@ class Game2048(gym.Env):
         info = {
             "score": self.score,
             "moves": self.moves_made,
+            "total_steps": self.total_steps,
+            "consecutive_invalid_moves": self.consecutive_invalid_moves,
             "game_over": False
         }
         
@@ -313,7 +337,9 @@ class Game2048(gym.Env):
     def _render_string(self) -> str:
         """Generate string representation of the game state."""
         lines = ["\n2048 Game State:"]
-        lines.append(f"Score: {self.score} | Moves: {self.moves_made}")
+        lines.append(f"Score: {self.score} | Valid Moves: {self.moves_made} | Total Steps: {self.total_steps}")
+        if self.consecutive_invalid_moves > 0:
+            lines.append(f"Consecutive Invalid Moves: {self.consecutive_invalid_moves}")
         lines.append("-" * 25)
         
         for i in range(4):
@@ -330,6 +356,14 @@ class Game2048(gym.Env):
         lines.append("-" * 25)
         return "\n".join(lines)
 
+    def _get_truncation_reason(self) -> str:
+        """Get the reason for truncation."""
+        if self.total_steps >= self.max_episode_steps:
+            return "max_steps_reached"
+        elif self.consecutive_invalid_moves >= self.max_consecutive_invalid_moves:
+            return "too_many_invalid_moves"
+        return "unknown"
+    
     def close(self) -> None:
         """Clean up resources."""
         pass
