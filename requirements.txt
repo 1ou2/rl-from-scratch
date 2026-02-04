@@ -1,3 +1,5 @@
 torch
 gymnasium
 pygame
+matplotlib
+tqdm
