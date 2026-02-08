@@ -29,6 +29,7 @@ def resume_training(checkpoint_path=None):
     Args:
         checkpoint_path: Path to specific checkpoint, or None to use latest
     """
+    import torch
     
     if checkpoint_path is None:
         checkpoint_path = find_latest_checkpoint()
@@ -45,6 +46,19 @@ def resume_training(checkpoint_path=None):
         for cp in sorted(checkpoints):
             print(f"  - {cp}")
         return
+    
+    # Display checkpoint info
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    print(f"\nCheckpoint Details:")
+    print(f"  File: {checkpoint_path}")
+    print(f"  Episodes trained: {checkpoint.get('episodes', 'N/A')}")
+    print(f"  Total steps: {checkpoint.get('steps', 'N/A')}")
+    print(f"  Current epsilon: {checkpoint.get('epsilon', 'N/A'):.4f}")
+    
+    if 'hyperparameters' in checkpoint:
+        print(f"\n  Saved Hyperparameters:")
+        for key, value in checkpoint['hyperparameters'].items():
+            print(f"    - {key}: {value}")
     
     print(f"\nResuming training from: {checkpoint_path}")
     main(resume_from=checkpoint_path)

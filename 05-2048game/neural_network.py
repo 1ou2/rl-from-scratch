@@ -14,9 +14,10 @@ class DQN2048(nn.Module):
     
     Architecture:
     - Input: 16 values (flattened 4x4 grid)
-    - Hidden layers: 256 -> 128 -> 64 neurons
+    - Hidden layers: 512 -> 256 -> 128 neurons (increased capacity)
     - Output: 4 Q-values (one for each action: up, down, left, right)
     - Activation: ReLU
+    - Includes batch normalization and dropout for better training stability
     """
     
     def __init__(self, input_size: int = 16, output_size: int = 4):
@@ -29,11 +30,20 @@ class DQN2048(nn.Module):
         """
         super(DQN2048, self).__init__()
         
-        # Define the fully connected layers
-        self.fc1 = nn.Linear(input_size, 256)
-        self.fc2 = nn.Linear(256, 128) 
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, output_size)
+        # Define the fully connected layers with increased capacity
+        self.fc1 = nn.Linear(input_size, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.dropout1 = nn.Dropout(0.1)
+        
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.dropout2 = nn.Dropout(0.1)
+        
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.05)
+        
+        self.fc4 = nn.Linear(128, output_size)
         
         # Initialize weights using Xavier uniform initialization
         self._initialize_weights()
@@ -43,6 +53,11 @@ class DQN2048(nn.Module):
         for layer in [self.fc1, self.fc2, self.fc3, self.fc4]:
             nn.init.xavier_uniform_(layer.weight)
             nn.init.constant_(layer.bias, 0.0)
+        
+        # Initialize batch norm layers
+        for bn in [self.bn1, self.bn2, self.bn3]:
+            nn.init.constant_(bn.weight, 1.0)
+            nn.init.constant_(bn.bias, 0.0)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -62,10 +77,25 @@ class DQN2048(nn.Module):
         else:
             raise ValueError(f"Invalid input shape: {x.shape}. Expected (batch_size, 4, 4) or (batch_size, 16)")
         
-        # Forward pass through layers with ReLU activation
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
+        # Normalize input: scale from 0-16 range to 0-1
+        x = x / 16.0
+        
+        # Forward pass through layers with ReLU activation and batch norm
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout1(x)
+        
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.relu(x)
+        x = self.dropout3(x)
+        
         x = self.fc4(x)  # No activation on output layer for Q-values
         
         return x

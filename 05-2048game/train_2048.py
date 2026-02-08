@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import autocast, GradScaler  # Mixed precision training
 from collections import deque
 import random
 from typing import Tuple, List, Dict, Any
@@ -14,6 +15,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import json
 from datetime import datetime
+import time
 
 from game_2048 import Game2048
 from neural_network import DQN2048
@@ -41,9 +43,13 @@ class ReplayBuffer:
         """Add a transition to the buffer."""
         self.buffer.append((state, action, reward, next_state, done))
     
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
+    def sample(self, batch_size: int, device: torch.device = None) -> Tuple[torch.Tensor, ...]:
         """
         Sample a batch of transitions randomly.
+        
+        Args:
+            batch_size: Number of samples to retrieve
+            device: Device to place tensors on (GPU or CPU)
         
         Returns:
             Tuple of (states, actions, rewards, next_states, dones) as tensors
@@ -51,13 +57,27 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         
-        return (
-            torch.FloatTensor(np.array(states)),
-            torch.LongTensor(actions),
-            torch.FloatTensor(rewards),
-            torch.FloatTensor(np.array(next_states)),
-            torch.FloatTensor(dones)
-        )
+        # Stack numpy arrays without intermediate conversion
+        states_array = np.stack(states, axis=0)
+        next_states_array = np.stack(next_states, axis=0)
+        
+        # Create tensors directly on target device (avoids CPU overhead)
+        if device is not None:
+            return (
+                torch.from_numpy(states_array).float().to(device),
+                torch.tensor(actions, dtype=torch.long, device=device),
+                torch.tensor(rewards, dtype=torch.float32, device=device),
+                torch.from_numpy(next_states_array).float().to(device),
+                torch.tensor(dones, dtype=torch.float32, device=device)
+            )
+        else:
+            return (
+                torch.FloatTensor(states_array),
+                torch.LongTensor(actions),
+                torch.FloatTensor(rewards),
+                torch.FloatTensor(next_states_array),
+                torch.FloatTensor(dones)
+            )
     
     def __len__(self) -> int:
         return len(self.buffer)
@@ -82,12 +102,13 @@ class DQNTrainer:
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.01,
-        epsilon_decay: float = 0.995,
-        batch_size: int = 64,
-        buffer_capacity: int = 100000,
+        epsilon_decay: float = 0.9995,  # Much slower decay (0.9995 vs 0.995) to maintain exploration longer
+        batch_size: int = 256,  # Increased for better GPU utilization
+        buffer_capacity: int = 200000,  # Increased for better experience diversity
         target_update_freq: int = 1000,
         invalid_move_penalty: float = -10.0,
         use_double_dqn: bool = True,
+        train_steps_per_episode: int = 4,  # Multiple training passes per game step
         device: str = None
     ):
         """
@@ -105,6 +126,7 @@ class DQNTrainer:
             target_update_freq: Steps between target network updates
             invalid_move_penalty: Penalty for invalid moves
             use_double_dqn: Whether to use Double DQN
+            train_steps_per_episode: Number of training steps per game step (GPU utilization)
             device: Device to use ('cuda' or 'cpu')
         """
         self.env = env
@@ -117,6 +139,7 @@ class DQNTrainer:
         self.target_update_freq = target_update_freq
         self.invalid_move_penalty = invalid_move_penalty
         self.use_double_dqn = use_double_dqn
+        self.train_steps_per_episode = train_steps_per_episode
         
         # Set device
         if device is None:
@@ -136,6 +159,10 @@ class DQNTrainer:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.criterion = nn.SmoothL1Loss()  # Huber loss, more robust than MSE
         
+        # Mixed precision training (faster on GPU)
+        self.scaler = GradScaler(enabled=str(self.device) != 'cpu')
+        self.use_mixed_precision = str(self.device) != 'cpu'
+        
         # Replay buffer
         self.replay_buffer = ReplayBuffer(buffer_capacity)
         
@@ -148,7 +175,11 @@ class DQNTrainer:
             'episode_lengths': [],
             'max_tiles': [],
             'losses': [],
-            'epsilons': []
+            'epsilons': [],
+            'timing_game_steps': [],
+            'timing_train_sampling': [],
+            'timing_train_forward': [],
+            'timing_train_backward': []
         }
     
     def select_action(self, state: np.ndarray, training: bool = True) -> int:
@@ -167,60 +198,78 @@ class DQNTrainer:
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            self.policy_net.eval()
             q_values = self.policy_net(state_tensor)
+            self.policy_net.train()
             return q_values.argmax(dim=1).item()
     
     def update_target_network(self) -> None:
         """Update target network with policy network weights."""
         self.target_net.load_state_dict(self.policy_net.state_dict())
     
-    def train_step(self) -> float:
+    def train_step(self, num_steps: int = 1) -> Tuple[float, Dict[str, float]]:
         """
-        Perform one training step (sample batch and update network).
+        Perform multiple training steps (sample batch and update network).
+        
+        Args:
+            num_steps: Number of training steps to perform in this call
         
         Returns:
-            Loss value
+            Tuple of (average_loss, timings_dict)
         """
         if len(self.replay_buffer) < self.batch_size:
-            return 0.0
+            return 0.0, {}
         
-        # Sample batch from replay buffer
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        total_loss = 0.0
+        timings = {'sampling': 0.0, 'forward': 0.0, 'backward': 0.0}
         
-        # Move to device
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
-        
-        # Current Q-values: Q(s, a)
-        current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        
-        # Compute target Q-values
-        with torch.no_grad():
-            if self.use_double_dqn:
-                # Double DQN: use policy net to select action, target net to evaluate
-                next_actions = self.policy_net(next_states).argmax(dim=1)
-                next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            else:
-                # Standard DQN
-                next_q_values = self.target_net(next_states).max(dim=1)[0]
+        for _ in range(num_steps):
+            # Sample batch from replay buffer (optimized - tensors directly on device)
+            t0 = time.time()
+            states, actions, rewards, next_states, dones = self.replay_buffer.sample(
+                self.batch_size, device=self.device
+            )
+            timings['sampling'] += time.time() - t0
             
-            # Target: r + gamma * max_a Q_target(s', a) * (1 - done)
-            target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+            # Compute target Q-values
+            with torch.no_grad():
+                if self.use_double_dqn:
+                    # Double DQN: use policy net to select action, target net to evaluate
+                    next_actions = self.policy_net(next_states).argmax(dim=1)
+                    next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                else:
+                    # Standard DQN
+                    next_q_values = self.target_net(next_states).max(dim=1)[0]
+                
+                # Target: r + gamma * max_a Q_target(s', a) * (1 - done)
+                target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+            
+            # Mixed precision forward pass (faster on GPU)
+            t0 = time.time()
+            with autocast(device_type=str(self.device).split(':')[0], enabled=self.use_mixed_precision):
+                # Current Q-values: Q(s, a)
+                current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+                # Compute loss
+                loss = self.criterion(current_q_values, target_q_values)
+            timings['forward'] += time.time() - t0
+            
+            # Optimize the model with gradient scaling
+            t0 = time.time()
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            timings['backward'] += time.time() - t0
+            
+            total_loss += loss.item()
         
-        # Compute loss
-        loss = self.criterion(current_q_values, target_q_values)
+        # Average timings
+        for key in timings:
+            timings[key] /= num_steps
         
-        # Optimize the model
-        self.optimizer.zero_grad()
-        loss.backward()
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
-        self.optimizer.step()
-        
-        return loss.item()
+        return total_loss / num_steps, timings
     
     def train_episode(self) -> Dict[str, Any]:
         """
@@ -234,13 +283,21 @@ class DQNTrainer:
         episode_loss = 0
         num_updates = 0
         
+        # Timing breakdown
+        timing_game_steps = 0.0
+        timing_train_sampling = 0.0
+        timing_train_forward = 0.0
+        timing_train_backward = 0.0
+        
         done = False
         truncated = False
         
         while not (done or truncated):
-            # Select and perform action
+            # Time the game step
+            t0 = time.time()
             action = self.select_action(state, training=True)
             next_state, reward, done, truncated, info = self.env.step(action)
+            timing_game_steps += time.time() - t0
             
             # Apply penalty for invalid moves
             if not info['grid_changed']:
@@ -252,11 +309,14 @@ class DQNTrainer:
                 float(done)  # Only terminal states, not truncated
             )
             
-            # Perform training step
-            loss = self.train_step()
+            # Perform multiple training steps per game step (GPU utilization)
+            loss, timings = self.train_step(num_steps=self.train_steps_per_episode)
             if loss > 0:
                 episode_loss += loss
                 num_updates += 1
+                timing_train_sampling += timings['sampling']
+                timing_train_forward += timings['forward']
+                timing_train_backward += timings['backward']
             
             # Update target network periodically
             if self.steps % self.target_update_freq == 0:
@@ -280,13 +340,18 @@ class DQNTrainer:
             'max_tile': max_tile,
             'loss': avg_loss,
             'epsilon': self.epsilon,
-            'buffer_size': len(self.replay_buffer)
+            'buffer_size': len(self.replay_buffer),
+            # Timing breakdown
+            'timing_game_steps': timing_game_steps,
+            'timing_train_sampling': timing_train_sampling,
+            'timing_train_forward': timing_train_forward,
+            'timing_train_backward': timing_train_backward
         }
         
         self.episodes += 1
         return stats
     
-    def train(self, num_episodes: int, eval_freq: int = 100, save_freq: int = 500,
+    def train(self, num_episodes: int, eval_freq: int = 200, save_freq: int = 500,
               save_path: str = "models/dqn_2048.pth") -> None:
         """
         Train the agent for multiple episodes.
@@ -304,11 +369,14 @@ class DQNTrainer:
         if start_episode > 0:
             print(f"Resuming from episode {start_episode}, training until episode {target_episodes}")
         print(f"Policy Network: {sum(p.numel() for p in self.policy_net.parameters())} parameters")
+        print(f"Device: {self.device} | Mixed Precision: {self.use_mixed_precision}")
         print(f"Hyperparameters:")
         print(f"  - Learning rate: {self.optimizer.param_groups[0]['lr']}")
         print(f"  - Gamma: {self.gamma}")
         print(f"  - Batch size: {self.batch_size}")
+        print(f"  - Train steps per episode: {self.train_steps_per_episode}")
         print(f"  - Epsilon: {self.epsilon_start} -> {self.epsilon_end} (decay: {self.epsilon_decay})")
+        print(f"  - Epsilon schedule: decay 0.9995/ep (~15% at ep15k), reset to 0.15 at ep30k")
         print(f"  - Current epsilon: {self.epsilon:.4f}")
         print(f"  - Buffer capacity: {self.replay_buffer.buffer.maxlen}")
         print(f"  - Target update freq: {self.target_update_freq}")
@@ -328,6 +396,10 @@ class DQNTrainer:
             self.training_history['max_tiles'].append(stats['max_tile'])
             self.training_history['losses'].append(stats['loss'])
             self.training_history['epsilons'].append(stats['epsilon'])
+            self.training_history['timing_game_steps'].append(stats['timing_game_steps'])
+            self.training_history['timing_train_sampling'].append(stats['timing_train_sampling'])
+            self.training_history['timing_train_forward'].append(stats['timing_train_forward'])
+            self.training_history['timing_train_backward'].append(stats['timing_train_backward'])
             
             # Update best score
             if stats['score'] > best_score:
@@ -335,6 +407,12 @@ class DQNTrainer:
             
             # Use self.episodes (cumulative) instead of episode (loop counter)
             current_episode = self.episodes
+            
+            # Reset epsilon for renewed exploration at milestone (helps break plateaus)
+            if current_episode == 30000 and self.epsilon == self.epsilon_end:
+                old_epsilon = self.epsilon
+                self.epsilon = 0.15  # Higher reset: 15% exploration to discover new tiles
+                print(f"\n🔄 Epsilon reset at episode {current_episode}: {old_epsilon:.4f} → {self.epsilon:.4f} (15% exploration for new discoveries)\n")
             
             # Periodic evaluation and logging
             if current_episode % eval_freq == 0:
@@ -345,6 +423,13 @@ class DQNTrainer:
                 max_tile_achieved = np.max(recent_tiles)
                 avg_length = np.mean(self.training_history['episode_lengths'][-eval_freq:])
                 
+                # Timing breakdown
+                avg_game_time = np.mean(self.training_history['timing_game_steps'][-eval_freq:])
+                avg_sampling_time = np.mean(self.training_history['timing_train_sampling'][-eval_freq:])
+                avg_forward_time = np.mean(self.training_history['timing_train_forward'][-eval_freq:])
+                avg_backward_time = np.mean(self.training_history['timing_train_backward'][-eval_freq:])
+                total_train_time = avg_sampling_time + avg_forward_time + avg_backward_time
+                
                 print(f"\nEpisode {current_episode}/{target_episodes}")
                 print(f"  Avg Reward (last {eval_freq}): {avg_reward:.2f}")
                 print(f"  Avg Score (last {eval_freq}): {avg_score:.2f}")
@@ -354,6 +439,12 @@ class DQNTrainer:
                 print(f"  Best Score: {best_score}")
                 print(f"  Epsilon: {self.epsilon:.4f}")
                 print(f"  Buffer size: {len(self.replay_buffer)}")
+                print(f"\n  ⏱️  Timing Breakdown (per episode):")
+                print(f"    - Game steps: {avg_game_time*1000:.1f}ms ({avg_game_time/(avg_game_time+total_train_time)*100:.1f}%)")
+                print(f"    - Training: {total_train_time*1000:.1f}ms ({total_train_time/(avg_game_time+total_train_time)*100:.1f}%)")
+                print(f"      └─ Sampling: {avg_sampling_time*1000:.2f}ms")
+                print(f"      └─ Forward: {avg_forward_time*1000:.2f}ms")
+                print(f"      └─ Backward: {avg_backward_time*1000:.2f}ms")
                 
                 # Evaluate agent
                 eval_stats = self.evaluate(num_episodes=5)
@@ -422,7 +513,19 @@ class DQNTrainer:
             'episodes': self.episodes,
             'steps': self.steps,
             'epsilon': self.epsilon,
-            'training_history': self.training_history
+            'training_history': self.training_history,
+            # Save hyperparameters for validation on resume
+            'hyperparameters': {
+                'gamma': self.gamma,
+                'epsilon_start': self.epsilon_start,
+                'epsilon_end': self.epsilon_end,
+                'epsilon_decay': self.epsilon_decay,
+                'batch_size': self.batch_size,
+                'target_update_freq': self.target_update_freq,
+                'invalid_move_penalty': self.invalid_move_penalty,
+                'use_double_dqn': self.use_double_dqn,
+                'train_steps_per_episode': self.train_steps_per_episode
+            }
         }
         
         torch.save(checkpoint, path)
@@ -439,6 +542,43 @@ class DQNTrainer:
         self.steps = checkpoint['steps']
         self.epsilon = checkpoint['epsilon']
         self.training_history = checkpoint['training_history']
+        
+        # Ensure all required timing keys exist (for backward compatibility with old checkpoints)
+        timing_keys = ['timing_game_steps', 'timing_train_sampling', 'timing_train_forward', 'timing_train_backward']
+        for key in timing_keys:
+            if key not in self.training_history:
+                self.training_history[key] = [0.0] * len(self.training_history.get('episode_rewards', []))
+        
+        # Validate hyperparameters if they were saved in checkpoint
+        if 'hyperparameters' in checkpoint:
+            saved_hparams = checkpoint['hyperparameters']
+            current_hparams = {
+                'gamma': self.gamma,
+                'epsilon_start': self.epsilon_start,
+                'epsilon_end': self.epsilon_end,
+                'epsilon_decay': self.epsilon_decay,
+                'batch_size': self.batch_size,
+                'target_update_freq': self.target_update_freq,
+                'invalid_move_penalty': self.invalid_move_penalty,
+                'use_double_dqn': self.use_double_dqn,
+                'train_steps_per_episode': self.train_steps_per_episode
+            }
+            
+            mismatches = []
+            for key in saved_hparams:
+                if key in current_hparams and saved_hparams[key] != current_hparams[key]:
+                    mismatches.append(
+                        f"  {key}: saved={saved_hparams[key]}, current={current_hparams[key]}"
+                    )
+            
+            if mismatches:
+                print(f"\n{'='*60}")
+                print("WARNING: Hyperparameter mismatch detected!")
+                print("The following hyperparameters differ from the checkpoint:")
+                for msg in mismatches:
+                    print(msg)
+                print(f"{'='*60}\n")
+                print("Consider updating main() to match the saved hyperparameters.")
         
         print(f"Model loaded from {path}")
         print(f"Resumed at episode {self.episodes}, step {self.steps}")
@@ -530,12 +670,13 @@ def main(resume_from: str = None):
         gamma=0.99,
         epsilon_start=1.0,
         epsilon_end=0.01,
-        epsilon_decay=0.995,
-        batch_size=64,
+        epsilon_decay=0.9995,  # Slower decay: maintain ~15% exploration even after 15k episodes
+        batch_size=256,  # Proven optimal: 384 trades learning for speed (not worth it)
         buffer_capacity=100000,
         target_update_freq=1000,
         invalid_move_penalty=-10.0,
-        use_double_dqn=True
+        use_double_dqn=True,
+        train_steps_per_episode=2  # Keep balanced: 2 is sweet spot for stability
     )
     
     # Resume from checkpoint if provided
@@ -548,8 +689,8 @@ def main(resume_from: str = None):
     
     # Train the agent
     trainer.train(
-        num_episodes=5000,
-        eval_freq=100,
+        num_episodes=30000,
+        eval_freq=500,  # Evaluate every 500 episodes for faster training
         save_freq=500,
         save_path="models/dqn_2048.pth"
     )
